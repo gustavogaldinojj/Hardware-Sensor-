@@ -1,24 +1,43 @@
 /*
-  EcoSmart Monitor - Firmware ESP32 + HC-SR04
-  ---------------------------------------------
-  Mede a distância até a superfície da água e classifica o nível como
-  NORMAL, MEDIA ou ALTA, enviando os dados via HTTP POST para o backend
-  FastAPI.
+  EcoSmart Monitor - Firmware ESP32 + HC-SR04 (CORRIGIDO)
+  ---------------------------------------------------------
+  Mede a distância até a superfície da água e envia a leitura ao backend
+  FastAPI, no formato exato que o endpoint /api/v1/sensores/nivel-agua
+  espera.
 
-  IMPORTANTE - AJUSTE ANTES DE USAR:
-  1) Preencha SSID e SENHA do WiFi
-  2) Preencha o IP/porta do seu backend (SERVER_URL)
-  3) Confirme os pinos do HC-SR04 (TRIG_PIN / ECHO_PIN)
-  4) Confirme a LÓGICA dos limiares (ver comentário abaixo) de acordo com
-     a posição física do sensor no seu reservatório/rio/caixa d'água.
+  PRÉ-REQUISITO OBRIGATÓRIO (fazer ANTES de gravar este firmware):
+  Cadastre o sensor uma única vez, chamando o endpoint administrativo
+  (troque a URL, o token admin e os valores conforme seu projeto):
 
-  Bibliotecas necessárias (instalar pela Arduino IDE > Gerenciador de Bibliotecas):
-  - WiFi.h        (já vem com o core do ESP32)
-  - HTTPClient.h  (já vem com o core do ESP32)
-  - ArduinoJson   (procurar por "ArduinoJson" de Benoit Blanchon)
+    curl -X PUT https://SEU-BACKEND/api/v1/sensores/config \
+         -H "X-Admin-Token: SEU_API_ADMIN_TOKEN" \
+         -H "Content-Type: application/json" \
+         -d '{
+               "nome": "Caixa dagua - Casa",
+               "latitude": -23.55,
+               "longitude": -46.63,
+               "altura_instalacao_cm": 100,
+               "limiar_alerta_cm": 80
+             }'
+
+  A resposta traz um campo "device_token" — copie o valor e cole em
+  DEVICE_TOKEN abaixo. Sem isso, toda leitura enviada recebe 403.
+
+  AJUSTE ANTES DE USAR:
+  1) SSID e SENHA do WiFi
+  2) SERVER_HOST (IP local para testes em rede, ou domínio do Render)
+  3) USE_HTTPS (true se for direto pro Render, false se for backend local http)
+  4) DEVICE_TOKEN (copiado do passo acima)
+  5) Pinos do HC-SR04 (TRIG_PIN / ECHO_PIN), se sua fiação for diferente
+
+  Bibliotecas necessárias (Arduino IDE > Gerenciador de Bibliotecas):
+  - WiFi.h / WiFiClientSecure.h  (já vêm com o core do ESP32)
+  - HTTPClient.h                 (já vem com o core do ESP32)
+  - ArduinoJson                  (procurar "ArduinoJson" de Benoit Blanchon)
 */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -26,24 +45,35 @@
 const char* WIFI_SSID = "NOME_DA_SUA_REDE";
 const char* WIFI_PASSWORD = "SENHA_DA_SUA_REDE";
 
-// Endereço do seu backend FastAPI (IP do notebook/servidor + porta 8000)
-const char* SERVER_URL = "http://192.168.0.100:8000/leituras";
+// Para testar na mesma rede local com o backend rodando via Docker Compose:
+//   SERVER_HOST = "192.168.0.100:8000"   (IP do seu computador na rede local)
+//   USE_HTTPS   = false
+// Para enviar direto pro backend hospedado no Render:
+//   SERVER_HOST = "ecosmart-backend-apcv.onrender.com"
+//   USE_HTTPS   = true
+const char* SERVER_HOST = "192.168.0.100:8000";
+const bool USE_HTTPS = false;
 
-// Identificador deste dispositivo (deve bater com o que você quiser ver no banco)
-const char* DEVICE_ID = "esp32-caixa-agua-01";
+// Caminho FIXO e CORRETO do endpoint real (não mude isso)
+const char* ENDPOINT_PATH = "/api/v1/sensores/nivel-agua";
+
+// Token do dispositivo, obtido no cadastro via PUT /api/v1/sensores/config
+// (ver instruções no topo deste arquivo). Sem isso, o backend responde 403.
+const char* DEVICE_TOKEN = "COLE_AQUI_O_DEVICE_TOKEN_RECEBIDO_NO_CADASTRO";
 
 // ---------------------- CONFIGURAÇÕES DO SENSOR ----------------------
 const int TRIG_PIN = 5;   // ajuste conforme sua fiação
 const int ECHO_PIN = 18;  // ajuste conforme sua fiação
 
-// ---------------------- LIMIARES DE CLASSIFICAÇÃO (cm) ----------------------
-// ATENÇÃO: estes valores representam a DISTÂNCIA medida pelo sensor até a água,
-// não a altura da água em si. Ajuste a lógica de comparação em classificarNivel()
-// se a montagem física do seu sensor for diferente (ex: sensor apontando de baixo
-// pra cima dentro de um poço).
-const float LIMIAR_NORMAL = 5.0;   // distância <= 5 cm  -> nível ALTA (água perto do sensor)
-const float LIMIAR_MEDIA  = 10.0;  // distância <= 10 cm -> nível MEDIA
-const float LIMIAR_ALTA   = 15.0;  // distância <= 15 cm -> nível NORMAL (água mais longe)
+// ---------------------- CLASSIFICAÇÃO LOCAL (SOMENTE PARA DEBUG NO SERIAL) ----------------------
+// IMPORTANTE: estes limiares NÃO são enviados ao backend e NÃO influenciam
+// a classificação de risco real do sistema. A classificação oficial é
+// feita pelo backend, usando "altura_instalacao_cm" e "limiar_alerta_cm"
+// configurados via API (mais fácil de ajustar sem regravar o firmware).
+// Isto aqui serve só para você acompanhar no Monitor Serial durante testes.
+const float LIMIAR_DEBUG_ALTA   = 5.0;
+const float LIMIAR_DEBUG_MEDIA  = 10.0;
+const float LIMIAR_DEBUG_NORMAL = 15.0;
 
 // Intervalo entre medições (ms)
 const unsigned long INTERVALO_ENVIO = 10000; // 10 segundos
@@ -58,11 +88,9 @@ void conectarWiFi() {
   Serial.print("'");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  int tentativas = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    tentativas++;
   }
 
   Serial.println();
@@ -76,17 +104,13 @@ void conectarWiFi() {
 
 // Mede a distância em cm usando o HC-SR04
 float medirDistanciaCm() {
-  // Garante que o TRIG está em nível baixo antes do pulso
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
 
-  // Envia o pulso de 10 microssegundos que dispara a medição
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  // Lê o tempo (em microssegundos) que o pino ECHO ficou em HIGH
-  // timeout de 30ms evita travar caso não haja retorno de eco
   long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
 
   Serial.println("---------------------------------------------");
@@ -100,7 +124,6 @@ float medirDistanciaCm() {
     return -1.0;
   }
 
-  // Velocidade do som ~0.0343 cm/us; divide por 2 porque o pulso vai e volta
   float distanciaCm = (duracao * 0.0343) / 2.0;
 
   Serial.print("[SENSOR] Distancia calculada: ");
@@ -110,55 +133,64 @@ float medirDistanciaCm() {
   return distanciaCm;
 }
 
-// Classifica o nível de água com base na distância medida
-String classificarNivel(float distanciaCm) {
+// Apenas para acompanhar no Serial Monitor durante os testes - NÃO é enviado ao backend
+void logClassificacaoDebug(float distanciaCm) {
   String status;
+  if (distanciaCm <= LIMIAR_DEBUG_ALTA) status = "alta (debug local)";
+  else if (distanciaCm <= LIMIAR_DEBUG_MEDIA) status = "media (debug local)";
+  else if (distanciaCm <= LIMIAR_DEBUG_NORMAL) status = "normal (debug local)";
+  else status = "abaixo_do_normal (debug local)";
 
-  if (distanciaCm <= LIMIAR_NORMAL) {
-    status = "alta";
-  } else if (distanciaCm <= LIMIAR_MEDIA) {
-    status = "media";
-  } else if (distanciaCm <= LIMIAR_ALTA) {
-    status = "normal";
-  } else {
-    status = "abaixo_do_normal"; // distância maior que todos os limiares
-  }
-
-  Serial.print("[CLASSIFICACAO] Nivel de agua: ");
-  Serial.print(status);
-  Serial.print("  (limiares: alta<=");
-  Serial.print(LIMIAR_NORMAL);
-  Serial.print("cm | media<=");
-  Serial.print(LIMIAR_MEDIA);
-  Serial.print("cm | normal<=");
-  Serial.print(LIMIAR_ALTA);
-  Serial.println("cm)");
-
-  return status;
+  Serial.print("[DEBUG LOCAL] Classificacao aproximada: ");
+  Serial.println(status);
+  Serial.println("[DEBUG LOCAL] A classificacao OFICIAL e feita pelo backend,");
+  Serial.println("              usando a altura de instalacao e o limiar de alerta");
+  Serial.println("              configurados via API (PUT /api/v1/sensores/config).");
 }
 
-// Envia os dados medidos para o backend FastAPI
-void enviarLeitura(float distanciaCm, const String& statusNivel) {
+// Envia a leitura para o backend, no formato exato esperado por SensorLeituraIn
+void enviarLeitura(float distanciaCm) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WIFI] Desconectado. Tentando reconectar...");
     conectarWiFi();
   }
 
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.addHeader("Content-Type", "application/json");
+  String url = String(USE_HTTPS ? "https://" : "http://") + SERVER_HOST + ENDPOINT_PATH;
 
-  // Monta o JSON no mesmo formato esperado pelo endpoint /leituras
-  StaticJsonDocument<256> doc;
-  doc["device_id"] = DEVICE_ID;
+  HTTPClient http;
+  WiFiClientSecure clienteSeguro;
+
+  bool iniciou;
+  if (USE_HTTPS) {
+    // Simplificação pragmática para um dispositivo de telemetria: não valida
+    // a cadeia de certificado do servidor (o Render usa HTTPS com CA pública,
+    // mas validar certificados no ESP32 exige fixar/atualizar o certificado
+    // raiz manualmente). A autenticação de quem pode enviar dados continua
+    // garantida pelo header X-Device-Token abaixo.
+    clienteSeguro.setInsecure();
+    iniciou = http.begin(clienteSeguro, url);
+  } else {
+    iniciou = http.begin(url);
+  }
+
+  if (!iniciou) {
+    Serial.println("[HTTP] ERRO: falha ao iniciar a conexao HTTP(S).");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+
+  // Formato EXATO esperado pelo schema SensorLeituraIn do backend:
+  // só "distancia_cm" (obrigatorio) e "bateria_v" (opcional, omitido aqui).
+  StaticJsonDocument<128> doc;
   doc["distancia_cm"] = distanciaCm;
-  doc["nivel_agua_cm"] = distanciaCm; // ajuste aqui se quiser enviar altura já convertida
 
   String corpoJson;
   serializeJson(doc, corpoJson);
 
   Serial.print("[HTTP] Destino: ");
-  Serial.println(SERVER_URL);
+  Serial.println(url);
   Serial.print("[HTTP] Corpo enviado: ");
   Serial.println(corpoJson);
 
@@ -167,18 +199,23 @@ void enviarLeitura(float distanciaCm, const String& statusNivel) {
   unsigned long duracaoRequisicao = millis() - inicio;
 
   if (codigoResposta > 0) {
-    Serial.print("[HTTP] Sucesso! Codigo: ");
+    Serial.print("[HTTP] Codigo: ");
     Serial.print(codigoResposta);
     Serial.print(" | Tempo: ");
     Serial.print(duracaoRequisicao);
     Serial.println(" ms");
     Serial.print("[HTTP] Resposta do servidor: ");
     Serial.println(http.getString());
+
+    if (codigoResposta == 403) {
+      Serial.println("[HTTP] 403 = DEVICE_TOKEN incorreto ou sensor nao cadastrado.");
+      Serial.println("       Confira o token com GET /api/v1/sensores/config.");
+    }
   } else {
     Serial.print("[HTTP] ERRO ao enviar POST: ");
     Serial.println(http.errorToString(codigoResposta));
-    Serial.println("[HTTP] Verifique: IP do servidor, se a API esta rodando,");
-    Serial.println("       e se o ESP32 esta na mesma rede.");
+    Serial.println("[HTTP] Verifique: host/porta do servidor, USE_HTTPS, e se o");
+    Serial.println("       ESP32 tem acesso de rede ate o backend.");
   }
 
   http.end();
@@ -189,7 +226,7 @@ void enviarLeitura(float distanciaCm, const String& statusNivel) {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // tempo pro monitor serial abrir e não perder as primeiras linhas
+  delay(1000);
 
   Serial.println();
   Serial.println("===============================================");
@@ -220,8 +257,8 @@ void loop() {
     float distancia = medirDistanciaCm();
 
     if (distancia >= 0) {
-      String nivel = classificarNivel(distancia);
-      enviarLeitura(distancia, nivel);
+      logClassificacaoDebug(distancia);
+      enviarLeitura(distancia);
     } else {
       Serial.println("[CICLO] Medicao invalida, pulando envio deste ciclo.");
       Serial.println("---------------------------------------------");
