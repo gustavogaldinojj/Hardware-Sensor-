@@ -30,6 +30,13 @@
   4) DEVICE_TOKEN (copiado do passo acima)
   5) Pinos do HC-SR04 (TRIG_PIN / ECHO_PIN), se sua fiação for diferente
 
+  FIAÇÃO ATUAL:
+  - Vermelho -> VIN (5V)      -> VCC do sensor
+  - Preto    -> GND           -> GND do sensor
+  - Azul     -> D26 (GPIO 26) -> TRIG
+  - Amarelo  -> D25 (GPIO 25) -> ECHO (via divisor de tensão 1k / 2k)
+  Se a duração do eco der sempre 0 us, inverta TRIG_PIN e ECHO_PIN.
+
   Bibliotecas necessárias (Arduino IDE > Gerenciador de Bibliotecas):
   - WiFi.h / WiFiClientSecure.h  (já vêm com o core do ESP32)
   - HTTPClient.h                 (já vem com o core do ESP32)
@@ -42,8 +49,8 @@
 #include <ArduinoJson.h>
 
 // ---------------------- CONFIGURAÇÕES DE REDE ----------------------
-const char* WIFI_SSID = "NOME_DA_SUA_REDE";
-const char* WIFI_PASSWORD = "SENHA_DA_SUA_REDE";
+const char* WIFI_SSID = "Oliveira _Gustavo";
+const char* WIFI_PASSWORD = "luccic181312";
 
 // Para testar na mesma rede local com o backend rodando via Docker Compose:
 //   SERVER_HOST = "192.168.0.100:8000"   (IP do seu computador na rede local)
@@ -51,7 +58,7 @@ const char* WIFI_PASSWORD = "SENHA_DA_SUA_REDE";
 // Para enviar direto pro backend hospedado no Render:
 //   SERVER_HOST = "ecosmart-backend-apcv.onrender.com"
 //   USE_HTTPS   = true
-const char* SERVER_HOST = "192.168.0.100:8000";
+const char* SERVER_HOST = "192.168.0.101:8000";
 const bool USE_HTTPS = false;
 
 // Caminho FIXO e CORRETO do endpoint real (não mude isso)
@@ -62,8 +69,11 @@ const char* ENDPOINT_PATH = "/api/v1/sensores/nivel-agua";
 const char* DEVICE_TOKEN = "COLE_AQUI_O_DEVICE_TOKEN_RECEBIDO_NO_CADASTRO";
 
 // ---------------------- CONFIGURAÇÕES DO SENSOR ----------------------
-const int TRIG_PIN = 5;   // ajuste conforme sua fiação
-const int ECHO_PIN = 18;  // ajuste conforme sua fiação
+const int TRIG_PIN = 26;  // fio azul  (D26)
+const int ECHO_PIN = 25;  // fio amarelo (D25)
+
+// Quantidade de leituras por ciclo (usa a mediana para filtrar ruído)
+const int NUM_LEITURAS = 5;
 
 // ---------------------- CLASSIFICAÇÃO LOCAL (SOMENTE PARA DEBUG NO SERIAL) ----------------------
 // IMPORTANTE: estes limiares NÃO são enviados ao backend e NÃO influenciam
@@ -78,31 +88,47 @@ const float LIMIAR_DEBUG_NORMAL = 15.0;
 // Intervalo entre medições (ms)
 const unsigned long INTERVALO_ENVIO = 10000; // 10 segundos
 
+// Tempo máximo tentando conectar no WiFi (ms)
+const unsigned long WIFI_TIMEOUT = 15000; // 15 segundos
+
 unsigned long ultimoEnvio = 0;
 
 // ---------------------- FUNÇÕES ----------------------
 
-void conectarWiFi() {
+// Tenta conectar no WiFi por até WIFI_TIMEOUT ms.
+// Retorna true se conectou, false se não (o firmware continua medindo).
+bool conectarWiFi() {
   Serial.print("[WIFI] Conectando na rede '");
   Serial.print(WIFI_SSID);
   Serial.print("'");
+
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT) {
     delay(500);
     Serial.print(".");
   }
-
   Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] Falhou ao conectar. Seguindo sem rede (so medicao local).");
+    Serial.println("[WIFI] Verifique SSID/senha e se a rede e 2.4 GHz.");
+    return false;
+  }
+
   Serial.println("[WIFI] Conectado com sucesso!");
   Serial.print("[WIFI] IP do ESP32: ");
   Serial.println(WiFi.localIP());
   Serial.print("[WIFI] Sinal (RSSI): ");
   Serial.print(WiFi.RSSI());
   Serial.println(" dBm");
+  return true;
 }
 
-// Mede a distância em cm usando o HC-SR04
+// Faz UMA medição de distância em cm usando o HC-SR04.
+// Retorna -1.0 se não houver eco.
 float medirDistanciaCm() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -113,24 +139,68 @@ float medirDistanciaCm() {
 
   long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
 
-  Serial.println("---------------------------------------------");
   Serial.print("[SENSOR] Duracao do pulso (echo): ");
   Serial.print(duracao);
-  Serial.println(" us");
+  Serial.print(" us");
 
   if (duracao == 0) {
-    Serial.println("[SENSOR] AVISO: sem retorno do eco (fora de alcance, objeto");
-    Serial.println("         muito perto/longe, ou erro de fiacao no TRIG/ECHO).");
+    Serial.println("  -> sem eco");
     return -1.0;
   }
 
   float distanciaCm = (duracao * 0.0343) / 2.0;
 
-  Serial.print("[SENSOR] Distancia calculada: ");
+  Serial.print("  -> ");
   Serial.print(distanciaCm);
   Serial.println(" cm");
 
   return distanciaCm;
+}
+
+// Faz várias medições e retorna a mediana das válidas (filtra leituras ruins).
+// Retorna -1.0 se nenhuma leitura for válida.
+float medirMediana() {
+  Serial.println("---------------------------------------------");
+
+  float valores[NUM_LEITURAS];
+  int n = 0;
+
+  for (int i = 0; i < NUM_LEITURAS; i++) {
+    float d = medirDistanciaCm();
+    if (d > 0) {
+      valores[n++] = d;
+    }
+    delay(60); // espera o eco anterior sumir antes de disparar de novo
+  }
+
+  if (n == 0) {
+    Serial.println("[SENSOR] AVISO: nenhum eco recebido (fora de alcance, objeto");
+    Serial.println("         muito perto/longe, ou TRIG/ECHO trocados/mal conectados).");
+    return -1.0;
+  }
+
+  // Ordena (bubble sort simples, poucos elementos)
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (valores[j] < valores[i]) {
+        float tmp = valores[i];
+        valores[i] = valores[j];
+        valores[j] = tmp;
+      }
+    }
+  }
+
+  float mediana = valores[n / 2];
+
+  Serial.print("[SENSOR] Leituras validas: ");
+  Serial.print(n);
+  Serial.print("/");
+  Serial.print(NUM_LEITURAS);
+  Serial.print(" | Mediana: ");
+  Serial.print(mediana);
+  Serial.println(" cm");
+
+  return mediana;
 }
 
 // Apenas para acompanhar no Serial Monitor durante os testes - NÃO é enviado ao backend
@@ -152,7 +222,11 @@ void logClassificacaoDebug(float distanciaCm) {
 void enviarLeitura(float distanciaCm) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WIFI] Desconectado. Tentando reconectar...");
-    conectarWiFi();
+    if (!conectarWiFi()) {
+      Serial.println("[HTTP] Sem WiFi, leitura nao enviada neste ciclo.");
+      Serial.println("---------------------------------------------");
+      return;
+    }
   }
 
   String url = String(USE_HTTPS ? "https://" : "http://") + SERVER_HOST + ENDPOINT_PATH;
@@ -178,6 +252,7 @@ void enviarLeitura(float distanciaCm) {
     return;
   }
 
+  http.setTimeout(15000); // Render pode demorar para "acordar"
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Token", DEVICE_TOKEN);
 
@@ -235,12 +310,35 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
 
-  Serial.println("[SETUP] Pinos do sensor configurados.");
+  Serial.print("[SETUP] Pinos do sensor configurados. TRIG=");
+  Serial.print(TRIG_PIN);
+  Serial.print(" ECHO=");
+  Serial.println(ECHO_PIN);
+
+  // Busca de redes (diagnostico)
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  Serial.println("[WIFI] Procurando redes...");
+  int n = WiFi.scanNetworks();
+  Serial.print("[WIFI] Redes encontradas: ");
+  Serial.println(n);
+  for (int i = 0; i < n; i++) {
+    Serial.print("  ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" (");
+    Serial.print(WiFi.RSSI(i));
+    Serial.println(" dBm)");
+  }
 
   conectarWiFi();
 
   Serial.println("[SETUP] Pronto! Iniciando ciclo de medicoes...");
+
+  // Forca a primeira medicao imediatamente
+  ultimoEnvio = millis() - INTERVALO_ENVIO;
 }
 
 void loop() {
@@ -254,7 +352,7 @@ void loop() {
     Serial.print(agora / 1000);
     Serial.println("s");
 
-    float distancia = medirDistanciaCm();
+    float distancia = medirMediana();
 
     if (distancia >= 0) {
       logClassificacaoDebug(distancia);
