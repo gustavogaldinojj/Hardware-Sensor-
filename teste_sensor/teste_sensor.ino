@@ -14,7 +14,7 @@
 #include <WiFi.h>
 
 const int PINO_A = 26;  // fio azul
-const int PINO_B = 25;  // fio amarelo
+const int PINO_B = 33;  // fio amarelo
 
 void testar(int trig, int echo) {
   pinMode(trig, OUTPUT);

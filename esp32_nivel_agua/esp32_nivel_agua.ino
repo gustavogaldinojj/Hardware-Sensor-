@@ -58,7 +58,7 @@ const char* WIFI_PASSWORD = "luccic181312";
 // Para enviar direto pro backend hospedado no Render:
 //   SERVER_HOST = "ecosmart-backend-apcv.onrender.com"
 //   USE_HTTPS   = true
-const char* SERVER_HOST = "192.168.0.101:8000";
+const char* SERVER_HOST = "192.168.0.104:8000";
 const bool USE_HTTPS = false;
 
 // Caminho FIXO e CORRETO do endpoint real (não mude isso)
@@ -66,11 +66,11 @@ const char* ENDPOINT_PATH = "/api/v1/sensores/nivel-agua";
 
 // Token do dispositivo, obtido no cadastro via PUT /api/v1/sensores/config
 // (ver instruções no topo deste arquivo). Sem isso, o backend responde 403.
-const char* DEVICE_TOKEN = "COLE_AQUI_O_DEVICE_TOKEN_RECEBIDO_NO_CADASTRO";
+const char* DEVICE_TOKEN = "9b9ba4c91505f4e46bc9b22a53d475f9dd6b2286fc4c55b7";
 
 // ---------------------- CONFIGURAÇÕES DO SENSOR ----------------------
 const int TRIG_PIN = 26;  // fio azul  (D26)
-const int ECHO_PIN = 25;  // fio amarelo (D25)
+const int ECHO_PIN = 33;  // fio amarelo (D25)
 
 // Quantidade de leituras por ciclo (usa a mediana para filtrar ruído)
 const int NUM_LEITURAS = 5;
